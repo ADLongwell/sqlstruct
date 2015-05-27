@@ -110,9 +110,15 @@ var finfoLock sync.RWMutex
 
 // tagName is the name of the tag to use on struct fields
 const tagName = "sql"
+const nullAltTagName = "sqlnull"
 
 // fieldInfo is a mapping of field tag values to their indices
-type fieldInfo map[string][]int
+type fieldInfo map[string]fieldDetails
+
+type fieldDetails struct {
+	nullAlternative string
+	index           []int
+}
 
 func init() {
 	finfos = make(map[reflect.Type]fieldInfo)
@@ -141,6 +147,7 @@ func getFieldInfo(typ reflect.Type) fieldInfo {
 	for i := 0; i < n; i++ {
 		f := typ.Field(i)
 		tag := f.Tag.Get(tagName)
+		nullAlt := f.Tag.Get(nullAltTagName)
 
 		// Skip unexported fields or fields marked with "-"
 		if f.PkgPath != "" || tag == "-" {
@@ -149,8 +156,11 @@ func getFieldInfo(typ reflect.Type) fieldInfo {
 
 		// Handle embedded structs
 		if f.Anonymous && f.Type.Kind() == reflect.Struct {
-			for k, v := range getFieldInfo(f.Type) {
-				finfo[k] = append([]int{i}, v...)
+			for k, details := range getFieldInfo(f.Type) {
+				finfo[k] = fieldDetails{
+					nullAlternative: nullAlt,
+					index:           append([]int{i}, details.index...),
+				}
 			}
 			continue
 		}
@@ -161,7 +171,10 @@ func getFieldInfo(typ reflect.Type) fieldInfo {
 		}
 		tag = NameMapper(tag)
 
-		finfo[tag] = []int{i}
+		finfo[tag] = fieldDetails{
+			nullAlternative: nullAlt,
+			index:           []int{i},
+		}
 	}
 
 	finfoLock.Lock()
@@ -206,8 +219,14 @@ func Columns(s interface{}) string {
 func ColumnsAliased(s interface{}, alias string) string {
 	names := cols(s)
 	aliased := make([]string, 0, len(names))
+	fieldMap := getFieldInfo(reflect.ValueOf(s).Type())
+
 	for _, n := range names {
-		aliased = append(aliased, alias+"."+n+" AS "+alias+"_"+n)
+		if d, _ := fieldMap[n]; d.nullAlternative != "" {
+			aliased = append(aliased, "COALESCE("+alias+"."+n+","+d.nullAlternative+") AS "+alias+"_"+n)
+		} else {
+			aliased = append(aliased, alias+"."+n+" AS "+alias+"_"+n)
+		}
 	}
 	return strings.Join(aliased, ", ")
 }
@@ -246,13 +265,13 @@ func doScan(dest interface{}, rows Rows, alias string) (err error) {
 		if len(alias) > 0 {
 			name = strings.Replace(name, alias+"_", "", 1)
 		}
-		idx, ok := fieldInfo[strings.ToLower(name)]
+		details, ok := fieldInfo[strings.ToLower(name)]
 		var v interface{}
 		if !ok {
 			// There is no field mapped to this column so we discard it
 			v = &sql.RawBytes{}
 		} else {
-			v = elem.FieldByIndex(idx).Addr().Interface()
+			v = elem.FieldByIndex(details.index).Addr().Interface()
 		}
 		values = append(values, v)
 	}
